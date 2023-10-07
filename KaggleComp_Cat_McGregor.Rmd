@@ -1,0 +1,337 @@
+---
+title: "Kaggle Comp Categorical"
+author: "Jen McGregor"
+date: "12/6/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(rpart.plot)
+library(discrim)
+library(baguette)
+library(janitor)
+library(readr)
+library(nnet)
+set.seed(1)
+```
+
+# Load in the Data
+
+```{r}
+myData <- read_csv("CAH-201803-train.csv")
+```
+
+# Data Wrangling
+
+```{r}
+myData <- myData %>% rename(
+  gender=Q1,
+  age=Q2,
+  lib_cons_mod=Q4,
+  education=Q5,
+  race=Q6,
+  ban_prostitution=Q7,
+  ban_smoke=Q8,
+  ban_organs=Q9,
+  religious=Q10,
+  life_choice=Q11,
+  disapp_cas_sex=Q12,
+  smoke_cas_sex=Q13,
+  ban_abortion_cas_sex=Q14,
+  autonomy=Q15,
+  abortion_wrong=Q16,
+  yes_cas_sex=Q17,
+  duties_official_misconduct=Q18
+)
+
+myData$gender <- ifelse(myData$gender=="Male",1,0)
+
+myData$lib_cons_mod <- ifelse(myData$lib_cons_mod=="Liberal",1,
+                                         ifelse(myData$lib_cons_mod=="Conservative",2,3))
+
+myData$education <- ifelse(myData$education=="High school or less",1,
+                             ifelse(myData$education=="Some college",2,
+                                    ifelse(myData$education=="College degree",3,4)))
+#made binary with white or not white
+myData$race <- ifelse(myData$race=="White",1,0)
+
+myData$ban_prostitution <- ifelse(myData$ban_prostitution=="Yes",1,0)
+myData$ban_smoke <- ifelse(myData$ban_smoke=="Yes",1,0)
+myData$ban_organs <- ifelse(myData$ban_organs=="Yes",1,0)
+
+
+myData$religious <- ifelse(myData$religious=="No",1,
+                             ifelse(myData$religious=="Yes, somewhat religious",2,3))
+
+myData$life_choice <- ifelse(myData$life_choice=="Pro-Choice",1,0)
+myData$disapp_cas_sex <- ifelse(myData$disapp_cas_sex=="Yes",1,0)
+myData$smoke_cas_sex <- ifelse(myData$smoke_cas_sex=="Yes",1,0)
+
+#made binary: 1 if behave differently, 0 if not different
+myData$ban_abortion_cas_sex <- ifelse(myData$ban_abortion_cas_sex=="Behave no differently",0,1)
+
+#made binary, 1 if 5 (assumed strongly agree); 0 if otherwise: 1-4 (disagree)
+#Notice no 3's
+myData$autonomy <- ifelse(myData$autonomy==5,1,0)
+
+
+#dimension reduction, 4 if 5 (assumed strongly agree); 3 if 4 etc
+#Notice no 3's
+myData$abortion_wrong <- ifelse(myData$abortion_wrong==5,4,
+                             ifelse(myData$abortion_wrong==4,3,
+                                    ifelse(myData$abortion_wrong==3,2,1)))
+#dimension reduction, 4 if 5 (assumed strongly agree); 3 if 4 etc
+#Notice no 3's
+myData$yes_cas_sex <- ifelse(myData$yes_cas_sex==5,4,
+                             ifelse(myData$yes_cas_sex==4,3,
+                                    ifelse(myData$yes_cas_sex==3,2,1)))
+
+myData$duties_official_misconduct <- ifelse(myData$duties_official_misconduct=="Yes",1,0)
+
+#turn variables into factors
+myData[sapply(myData, is.numeric)] <- lapply(myData[sapply(myData, is.numeric)],as.factor)
+
+myData$political_affiliation <- as.factor(myData$political_affiliation)
+
+#turn age, id into numeric
+myData$id_num <- as.numeric(myData$id_num)
+myData$age <- as.numeric(myData$age)
+
+myData <- myData[-1]
+```
+
+```{r}
+set.seed(1)
+splits <- myData %>% 
+  initial_split(0.5,strata = political_affiliation)
+train <- splits %>% training()
+test <- splits %>% testing()
+
+cv <- vfold_cv(myData, v = 10)
+```
+
+#finding best model 
+
+```{r, logit}
+recipe <- recipe(political_affiliation ~ lib_cons_mod+age+abortion_wrong+race+religious+life_choice, data = myData) %>%
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -political_affiliation)
+
+lr_mod <- multinom_reg() %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+lr_wflow <- workflow() %>%
+  add_model(lr_mod) %>%
+  add_recipe(recipe) 
+
+lr_wflow %>%
+  fit_resamples(cv) %>%
+  collect_metrics()
+
+lr_final <- lr_wflow %>% fit(myData)
+
+lr_preds <- predict(lr_final, myData)
+#lr_preds <- lr_preds[-85,]
+logit_table <- myData %>%
+  mutate(
+   preds = lr_preds$.pred_class 
+  ) %>%
+  count(preds, political_affiliation)
+logit_table
+
+#Accuracy Overall
+sum(logit_table$n[1]+logit_table$n[5]+logit_table$n[9])/sum(logit_table$n)
+
+#Predicting Democrat
+logit_table$n[1]/sum(sum(logit_table$n[c(2:3)])+logit_table$n[1])
+
+#Predicting Independent
+logit_table$n[5]/sum(sum(logit_table$n[c(4:6)])+logit_table$n[5])
+
+#Predicting Republican
+logit_table$n[9]/sum(sum(logit_table$n[c(7:8)])+logit_table$n[9])
+
+```
+
+```{r, KNN}
+knn_mod <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+k_grid <- grid_regular(neighbors(c(2, 40)), levels = 10)
+
+knn_wflow <- workflow() %>%
+  add_model(knn_mod) %>%
+  add_recipe(recipe) 
+
+knn_wflow %>%
+  tune_grid(
+    grid = k_grid,
+    resamples = cv
+  ) %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  arrange(desc(mean))
+
+#The best accuracy was found to be around K = 6, with accuracy value of 0.6386029
+
+knn_mod_final <- nearest_neighbor(neighbors = 6) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_wflow <- workflow() %>%
+  add_model(knn_mod_final) %>%
+  add_recipe(recipe) 
+
+knn_final <- knn_wflow %>% fit(myData)
+
+knn_preds <- predict(knn_final, myData)
+
+KNN_table <- myData %>%
+  mutate(
+   preds = knn_preds$.pred_class 
+  ) %>%
+  count(preds, political_affiliation)
+KNN_table
+
+#Accuracy Overall
+sum(KNN_table$n[1]+KNN_table$n[5]+KNN_table$n[9])/sum(KNN_table$n)
+
+#Predicting Democrat
+KNN_table$n[1]/sum(sum(KNN_table$n[c(2:3)])+KNN_table$n[1])
+
+#Predicting Independent
+KNN_table$n[5]/sum(sum(KNN_table$n[c(4:6)])+KNN_table$n[5])
+
+#Predicting Republican
+KNN_table$n[9]/sum(sum(KNN_table$n[c(7:8)])+KNN_table$n[9])
+```
+
+```{r}
+test_data <- read_csv("CAH-201803-test.csv")
+```
+
+```{r, decision tree}
+recipe <- recipe(political_affiliation ~ ., data = myData) %>%
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -political_affiliation)
+
+tree_mod <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_wflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(tree_mod)
+
+tree_fit <- tree_wflow %>%
+  fit(myData)
+
+tree_pred <- myData %>% 
+        select(political_affiliation) %>%
+  bind_cols(
+    predict(tree_fit, myData),
+    predict(tree_fit, myData, type = "prob")
+  )
+
+tree_pred %>%
+  accuracy(estimate = .pred_class,
+           truth = political_affiliation)
+
+tree_fitted <- tree_fit %>%
+  pull_workflow_fit()
+
+rpart.plot(tree_fitted$fit)
+#lib_cons_mod, age, abortion_wrong, race, religious, life_choice
+```
+
+
+
+```{r, test data}
+test_data <- test_data %>% rename(
+  gender=Q1,
+  age=Q2,
+  lib_cons_mod=Q4,
+  education=Q5,
+  race=Q6,
+  ban_prostitution=Q7,
+  ban_smoke=Q8,
+  ban_organs=Q9,
+  religious=Q10,
+  life_choice=Q11,
+  disapp_cas_sex=Q12,
+  smoke_cas_sex=Q13,
+  ban_abortion_cas_sex=Q14,
+  autonomy=Q15,
+  abortion_wrong=Q16,
+  yes_cas_sex=Q17,
+  duties_official_misconduct=Q18
+)
+
+test_data$gender <- ifelse(test_data$gender=="Male",1,0)
+
+test_data$lib_cons_mod <- ifelse(test_data$lib_cons_mod=="Liberal",1,
+                                         ifelse(test_data$lib_cons_mod=="Conservative",2,3))
+
+test_data$education <- ifelse(test_data$education=="High school or less",1,
+                             ifelse(test_data$education=="Some college",2,
+                                    ifelse(test_data$education=="College degree",3,4)))
+#made binary with white or not white
+test_data$race <- ifelse(test_data$race=="White",1,0)
+
+test_data$ban_prostitution <- ifelse(test_data$ban_prostitution=="Yes",1,0)
+test_data$ban_smoke <- ifelse(test_data$ban_smoke=="Yes",1,0)
+test_data$ban_organs <- ifelse(test_data$ban_organs=="Yes",1,0)
+
+
+test_data$religious <- ifelse(test_data$religious=="No",1,
+                             ifelse(test_data$religious=="Yes, somewhat religious",2,3))
+
+test_data$life_choice <- ifelse(test_data$life_choice=="Pro-Choice",1,0)
+test_data$disapp_cas_sex <- ifelse(test_data$disapp_cas_sex=="Yes",1,0)
+test_data$smoke_cas_sex <- ifelse(test_data$smoke_cas_sex=="Yes",1,0)
+
+#made binary: 1 if behave differently, 0 if not different
+test_data$ban_abortion_cas_sex <- ifelse(test_data$ban_abortion_cas_sex=="Behave no differently",0,1)
+
+#made binary, 1 if 5 (assumed strongly agree); 0 if otherwise: 1-4 (disagree)
+#Notice no 3's
+test_data$autonomy <- ifelse(test_data$autonomy==5,1,0)
+
+
+#dimension reduction, 4 if 5 (assumed strongly agree); 3 if 4 etc
+#Notice no 3's
+test_data$abortion_wrong <- ifelse(test_data$abortion_wrong==5,4,
+                             ifelse(test_data$abortion_wrong==4,3,
+                                    ifelse(test_data$abortion_wrong==3,2,1)))
+#dimension reduction, 4 if 5 (assumed strongly agree); 3 if 4 etc
+#Notice no 3's
+test_data$yes_cas_sex <- ifelse(test_data$yes_cas_sex==5,4,
+                             ifelse(test_data$yes_cas_sex==4,3,
+                                    ifelse(test_data$yes_cas_sex==3,2,1)))
+
+test_data$duties_official_misconduct <- ifelse(test_data$duties_official_misconduct=="Yes",1,0)
+
+#turn variables into factors
+test_data[sapply(test_data, is.numeric)] <- lapply(test_data[sapply(test_data, is.numeric)],as.factor)
+
+#turn age
+test_data$age <- as.numeric(test_data$age)
+```
+
+```{r}
+final_predictions <- data.frame(
+    id_num  = test_data$id_num,
+    political_affiliation_predicted = predict(lr_final, test_data)$.pred_class
+)
+final_predictions
+final_predictions %>% write_csv("final_predictions.csv")
+
+table(final_predictions$political_affiliation_predicted)
+```
+
+
